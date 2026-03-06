@@ -14,6 +14,8 @@ services:
       - MAX_UPLOAD_SIZE_MB=500
       - UPLOAD_TTL_HOURS=1
       - MAX_PARALLEL_WORKERS=2
+      - DUCKDB_MEMORY_LIMIT=512MB
+      - DUCKDB_THREADS=2
       - LOG_LEVEL=INFO
       - MCP_TRANSPORT=sse
       - MCP_HOST=0.0.0.0

@@ -25,6 +25,13 @@ DEFAULT_TRANSPORT: str = os.getenv("MCP_TRANSPORT", "stdio")
 DEFAULT_HOST: str = os.getenv("MCP_HOST", "0.0.0.0")
 DEFAULT_PORT: int = int(os.getenv("MCP_PORT", "8080"))
 
+# --- Parallelism ---------------------------------------------------------
+MAX_PARALLEL_WORKERS: int = int(os.getenv("MAX_PARALLEL_WORKERS", "4"))
+
+# --- DuckDB (STREAM_ONLY engine for >2 GB CSVs) -------------------------
+DUCKDB_MEMORY_LIMIT: str = os.getenv("DUCKDB_MEMORY_LIMIT", "512MB")
+DUCKDB_THREADS: int = int(os.getenv("DUCKDB_THREADS", "4"))
+
 # --- Logging -------------------------------------------------------------
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 LOG_FORMAT: str = os.getenv(

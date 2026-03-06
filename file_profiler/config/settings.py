@@ -131,4 +131,5 @@ NULL_SENTINEL_VALUES: list[str] = [
 # Max workers for parallel file profiling.
 # Each worker may hold up to MEMORY_SAFE_MAX_BYTES in memory, so keep this
 # conservative.  Set to 1 to disable parallelism.
-MAX_PARALLEL_WORKERS: int = 4
+# Reads from env var MAX_PARALLEL_WORKERS (set in docker-compose / .env).
+from file_profiler.config.env import MAX_PARALLEL_WORKERS  # noqa: E402

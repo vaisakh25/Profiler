@@ -39,6 +39,10 @@ from file_profiler.intake.errors import CorruptFileError
 from file_profiler.intake.validator import IntakeResult
 from file_profiler.models.enums import SizeStrategy
 from file_profiler.models.file_profile import RawColumnData
+from file_profiler.engines.duckdb_sampler import (
+    duckdb_count,
+    duckdb_sample,
+)
 from file_profiler.strategy.size_strategy import effective_size
 
 log = logging.getLogger(__name__)
@@ -82,6 +86,10 @@ def profile(
             return _profile_zip_partition(path, strategy, intake, entries)
 
     # Single file (plain, gz, or single-entry zip).
+    # For STREAM_ONLY uncompressed files, use DuckDB for fast parallel sampling.
+    if strategy == SizeStrategy.STREAM_ONLY and intake.compression is None:
+        return _profile_with_duckdb(path, intake)
+
     struct = _detect_structure(path, intake)
     headers, has_header = _detect_headers(path, intake, struct)
     row_count, is_exact = _estimate_row_count(path, intake, struct, strategy)
@@ -93,6 +101,57 @@ def profile(
 
     raw_columns = _build_raw_columns(headers, sampled_rows, row_count)
     return raw_columns, row_count, is_exact
+
+
+# ---------------------------------------------------------------------------
+# DuckDB fast path (STREAM_ONLY, uncompressed)
+# ---------------------------------------------------------------------------
+
+def _profile_with_duckdb(
+    path: Path,
+    intake: IntakeResult,
+) -> tuple[list[RawColumnData], int, bool]:
+    """
+    Profile a large uncompressed CSV via DuckDB.
+
+    DuckDB handles structure detection, delimiter sniffing, row counting,
+    and reservoir sampling in parallel — replacing four separate Python
+    streaming passes with two fast DuckDB queries.
+
+    Falls back to the Python STREAM_ONLY path if DuckDB fails (e.g.
+    unsupported encoding, malformed file that DuckDB rejects).
+    """
+    delimiter = intake.delimiter_hint or ","
+    encoding = intake.encoding
+
+    try:
+        row_count = duckdb_count(path, delimiter=delimiter, encoding=encoding)
+        headers, sampled_rows = duckdb_sample(
+            path, delimiter=delimiter, encoding=encoding,
+        )
+    except Exception as exc:
+        log.warning(
+            "DuckDB sampling failed for %s: %s — falling back to Python streaming",
+            path.name, exc,
+        )
+        struct = _detect_structure(path, intake)
+        headers_fb, has_header = _detect_headers(path, intake, struct)
+        row_count = _stream_row_count(path, intake, struct)
+        sampled_rows = _skip_interval_sample(path, intake, struct, has_header)
+        if not sampled_rows:
+            return [], row_count, True
+        return _build_raw_columns(headers_fb, sampled_rows, row_count), row_count, True
+
+    if not sampled_rows:
+        log.warning("DuckDB: no rows sampled from %s", path.name)
+        return [], row_count, True
+
+    raw_columns = _build_raw_columns(headers, sampled_rows, row_count)
+    log.info(
+        "DuckDB profiled: %s (%d rows, %d columns, %d sampled)",
+        path.name, row_count, len(headers), len(sampled_rows),
+    )
+    return raw_columns, row_count, True
 
 
 # ---------------------------------------------------------------------------
