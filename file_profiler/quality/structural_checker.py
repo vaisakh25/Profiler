@@ -145,6 +145,8 @@ def _report_encoding_issues(encoding: str, issues: list[str]) -> None:
     used when UTF-8 decoding failed on the sniff sample.  That failure is a
     strong signal that the file contains mixed or misdeclared encodings.
     """
+    if encoding == "binary":
+        return  # Binary formats (Parquet, Excel) — encoding check not applicable
     normalised = encoding.lower().replace("-", "").replace("_", "")
     if normalised in ("latin1", "iso88591"):
         msg = (

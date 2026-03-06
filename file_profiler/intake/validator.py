@@ -50,6 +50,13 @@ _CHARDET_MIN_CONFIDENCE = 0.75
 _GZIP_MAGIC = b"\x1f\x8b"
 _ZIP_MAGIC  = b"PK\x03\x04"
 
+# Parquet magic bytes: "PAR1" at file start.
+_PARQUET_MAGIC = b"PAR1"
+
+# File extensions that are self-describing binary formats — encoding and
+# delimiter detection should be skipped entirely for these.
+_BINARY_EXTENSIONS = frozenset({".parquet", ".pq", ".parq", ".xlsx", ".xls"})
+
 
 # ---------------------------------------------------------------------------
 # Public result type
@@ -97,6 +104,19 @@ def validate(path: str | Path) -> IntakeResult:
     raw_header = _read_raw_bytes(path)
 
     compression = _detect_compression(raw_header)
+
+    # Binary formats (Parquet, Excel) are self-describing — skip encoding
+    # and delimiter detection to avoid false positives.
+    if path.suffix.lower() in _BINARY_EXTENSIONS or raw_header[:4] == _PARQUET_MAGIC:
+        return IntakeResult(
+            path=path,
+            size_bytes=size_bytes,
+            encoding="binary",
+            is_bom_present=False,
+            bom_encoding=None,
+            compression=compression,
+            delimiter_hint=None,
+        )
 
     # If compressed, decompress the sniff window so encoding detection works
     # on actual content bytes, not the gzip/zip wrapper.

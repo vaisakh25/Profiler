@@ -32,7 +32,7 @@ analyze_relationships(profiles, output_path)
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from file_profiler.analysis.relationship_detector import detect as _detect_relationships
@@ -297,10 +297,10 @@ def _profile_directory_parallel(
     output_dir: str | Path | None,
     workers: int,
 ) -> list[FileProfile]:
-    """Profile files in parallel using a process pool."""
+    """Profile files in parallel using a thread pool."""
     results: list[FileProfile] = []
     # Map future → file_path for logging on completion.
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         future_to_path = {
             pool.submit(_profile_one, fp, output_dir): fp
             for fp in candidates

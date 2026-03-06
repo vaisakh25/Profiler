@@ -37,6 +37,7 @@ from file_profiler.main import (
 )
 from file_profiler.intake.validator import validate
 from file_profiler.classification.classifier import classify
+from file_profiler.output.er_diagram_writer import generate as _generate_er_diagram
 from file_profiler.output.profile_writer import serialise, compute_quality_summary
 from file_profiler.models.file_profile import FileProfile
 from file_profiler.models.relationships import RelationshipReport
@@ -73,7 +74,17 @@ _relationship_cache: dict[str, Any] | None = None
 def _to_dict(profile: FileProfile) -> dict:
     """Serialise a FileProfile to a JSON-compatible dict."""
     profile.quality_summary = compute_quality_summary(profile)
-    return serialise(profile)
+    data = serialise(profile)
+    data["low_cardinality_columns"] = [
+        {
+            "name": col.name,
+            "distinct_count": col.distinct_count,
+            "top_values": serialise(col.top_values),
+        }
+        for col in profile.columns
+        if col.is_low_cardinality
+    ]
+    return data
 
 
 def _report_to_dict(
@@ -231,6 +242,8 @@ async def detect_relationships(
         await ctx.report_progress(2, 3, "Serialising report")
 
     result = _report_to_dict(report, min_confidence=confidence_threshold)
+    er_lines = _generate_er_diagram(results, report, min_confidence=confidence_threshold)
+    result["er_diagram"] = "\n".join(er_lines)
     _relationship_cache = result
 
     if ctx:
