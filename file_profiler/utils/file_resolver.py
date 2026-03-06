@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import base64
 import logging
+import shutil
+import time
 import uuid
 from pathlib import Path
 
-from file_profiler.config.env import DATA_DIR, UPLOAD_DIR, MAX_UPLOAD_SIZE_MB
+from file_profiler.config.env import DATA_DIR, UPLOAD_DIR, MAX_UPLOAD_SIZE_MB, UPLOAD_TTL_HOURS
 
 log = logging.getLogger(__name__)
 
@@ -81,6 +83,39 @@ def save_upload(file_name: str, content_base64: str) -> Path:
 
     log.info("Upload saved: %s (%d bytes)", dest, len(raw))
     return dest
+
+
+def cleanup_expired_uploads() -> int:
+    """
+    Remove upload subdirectories older than UPLOAD_TTL_HOURS.
+
+    Each upload lives in UPLOAD_DIR/<uuid>/.  We check directory mtime
+    against the TTL and remove the entire subdirectory if expired.
+
+    Returns:
+        Number of directories removed.
+    """
+    if not UPLOAD_DIR.exists():
+        return 0
+
+    ttl_seconds = UPLOAD_TTL_HOURS * 3600
+    cutoff = time.time() - ttl_seconds
+    removed = 0
+
+    for entry in UPLOAD_DIR.iterdir():
+        if not entry.is_dir():
+            continue
+        try:
+            if entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry)
+                removed += 1
+                log.info("Upload expired, removed: %s", entry.name)
+        except OSError as exc:
+            log.warning("Could not remove expired upload %s: %s", entry.name, exc)
+
+    if removed:
+        log.info("Upload cleanup: removed %d expired director(ies)", removed)
+    return removed
 
 
 def _is_subpath(child: Path, parent: Path) -> bool:

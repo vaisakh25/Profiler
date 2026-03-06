@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -41,7 +42,7 @@ from file_profiler.output.er_diagram_writer import generate as _generate_er_diag
 from file_profiler.output.profile_writer import serialise, compute_quality_summary
 from file_profiler.models.file_profile import FileProfile
 from file_profiler.models.relationships import RelationshipReport
-from file_profiler.utils.file_resolver import resolve_path, save_upload
+from file_profiler.utils.file_resolver import resolve_path, save_upload, cleanup_expired_uploads
 from file_profiler.utils.logging_setup import configure_logging
 
 log = logging.getLogger(__name__)
@@ -60,11 +61,49 @@ mcp = FastMCP(
 )
 
 # ---------------------------------------------------------------------------
-# In-memory caches
+# In-memory caches (bounded LRU)
 # ---------------------------------------------------------------------------
 
-_profile_cache: dict[str, dict] = {}
+_PROFILE_CACHE_MAX_SIZE: int = 200
+
+
+class _LRUCache(OrderedDict):
+    """OrderedDict-based LRU cache with a max size."""
+
+    def __init__(self, max_size: int) -> None:
+        super().__init__()
+        self._max_size = max_size
+
+    def __setitem__(self, key: str, value: dict) -> None:
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        if len(self) > self._max_size:
+            oldest = next(iter(self))
+            del self[oldest]
+            log.debug("Cache evicted: %s (max %d)", oldest, self._max_size)
+
+    def __getitem__(self, key: str) -> dict:
+        self.move_to_end(key)
+        return super().__getitem__(key)
+
+
+_profile_cache: _LRUCache = _LRUCache(_PROFILE_CACHE_MAX_SIZE)
 _relationship_cache: dict[str, Any] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Health endpoint (replaces /sse-based healthcheck)
+# ---------------------------------------------------------------------------
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request) -> "JSONResponse":
+    from starlette.responses import JSONResponse
+    return JSONResponse({
+        "status": "ok",
+        "server": "file-profiler",
+        "cached_profiles": len(_profile_cache),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +368,9 @@ async def upload_file(
     if ctx:
         await ctx.report_progress(0, 2, "Decoding upload")
 
+    # Opportunistic cleanup of expired uploads
+    cleanup_expired_uploads()
+
     dest = save_upload(file_name, file_content_base64)
 
     if ctx:
@@ -509,6 +551,9 @@ def main() -> None:
 
     # Ensure output directories exist
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Clean up expired uploads from previous runs
+    cleanup_expired_uploads()
 
     # Host and port are set on the FastMCP instance (used by sse/http transports)
     mcp.settings.host = args.host
