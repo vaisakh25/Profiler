@@ -119,9 +119,9 @@ erDiagram
     Sales_OrderLines {
         int orderlineid
         int orderid FK
-        int stockitemid FK
+        int stockitemid
         string description
-        int packagetypeid FK
+        int packagetypeid
         int quantity
         float unitprice
         float taxrate
@@ -150,20 +150,6 @@ erDiagram
         bool lasteditedby
         timestamp validfrom
         timestamp validto
-    }
-    purchasing_purchaseorderlines {
-        int purchaseorderlineid
-        int purchaseorderid
-        int stockitemid FK
-        int orderedouters
-        string description
-        int receivedouters
-        int packagetypeid FK
-        float expectedunitpriceperouter
-        timestamp lastreceiptdate
-        bool isorderlinefinalized
-        int lasteditedby
-        timestamp lasteditedwhen
     }
     purchasing_suppliercategories {
         int suppliercategoryid PK
@@ -227,7 +213,7 @@ erDiagram
         null customerid
         int buyinggroupid PK
         null customercategoryid
-        int stockgroupid FK
+        int stockgroupid
         categorical dealdescription
         timestamp startdate
         timestamp enddate
@@ -237,89 +223,8 @@ erDiagram
         int lasteditedby
         timestamp lasteditedwhen
     }
-    warehouse_colors {
-        int colorid PK
-        categorical colorname
-        bool lasteditedby
-        timestamp validfrom
-        timestamp validto
-    }
-    warehouse_packagetypes {
-        int packagetypeid PK
-        categorical packagetypename
-        bool lasteditedby
-        timestamp validfrom
-        timestamp validto
-    }
-    warehouse_stockgroups {
-        int stockgroupid PK
-        categorical stockgroupname
-        bool lasteditedby
-        timestamp validfrom
-        timestamp validto
-    }
-    warehouse_stockitemholdings {
-        int stockitemid PK
-        int quantityonhand
-        categorical binlocation
-        int laststocktakequantity
-        string lastcostprice
-        int reorderlevel
-        int targetstocklevel
-        int lasteditedby
-        categorical lasteditedwhen
-    }
-    warehouse_stockitems {
-        int stockitemid PK
-        string stockitemname
-        int supplierid FK
-        int colorid FK
-        int unitpackageid
-        int outerpackageid
-        categorical brand
-        categorical size
-        int leadtimedays
-        int quantityperouter
-        bool ischillerstock
-        int barcode
-        float taxrate
-        float unitprice
-        float recommendedretailprice
-        float typicalweightperunit
-        categorical marketingcomments
-        null internalcomments
-        null photo
-        categorical customfields
-        categorical tags
-        string searchdetails
-        bool lasteditedby
-        timestamp validfrom
-        timestamp validto
-    }
-    warehouse_stockitemstockgroups {
-        int stockitemstockgroupid
-        int stockitemid FK
-        int stockgroupid FK
-        bool lasteditedby
-        categorical lasteditedwhen
-    }
-    warehouse_stockitemtransactions {
-        int stockitemtransactionid
-        int stockitemid FK
-        int transactiontypeid FK
-        null customerid
-        null invoiceid
-        int supplierid FK
-        int purchaseorderid
-        timestamp transactionoccurredwhen
-        float quantity
-        int lasteditedby
-        timestamp lasteditedwhen
-    }
 
     Purchasing_Suppliers ||--o{ purchasing_suppliertransactions : "supplierid -> supplierid"
-    Purchasing_Suppliers ||--o{ warehouse_stockitems : "supplierid -> supplierid"
-    Purchasing_Suppliers ||--o{ warehouse_stockitemtransactions : "supplierid -> supplierid"
     application_deliverymethods ||--o{ Purchasing_Suppliers : "deliverymethodid -> deliverymethodid"
     application_deliverymethods ||--o{ Sales_Customers : "deliverymethodid -> deliverymethodid"
     application_paymentmethods ||--o{ purchasing_suppliertransactions : "paymentmethodid -> paymentmethodid"
@@ -328,27 +233,13 @@ erDiagram
     sales_buyinggroups ||--o{ Sales_Customers : "buyinggroupid -> buyinggroupid"
     sales_customercategories ||--o{ Sales_Customers : "customercategoryid -> customercategoryid"
     sales_specialdeals ||--o{ Sales_Customers : "buyinggroupid -> buyinggroupid"
-    warehouse_packagetypes ||--o{ purchasing_purchaseorderlines : "packagetypeid -> packagetypeid"
-    warehouse_packagetypes ||--o{ Sales_OrderLines : "packagetypeid -> packagetypeid"
-    warehouse_stockgroups ||--o{ sales_specialdeals : "stockgroupid -> stockgroupid"
-    warehouse_stockgroups ||--o{ warehouse_stockitemstockgroups : "stockgroupid -> stockgroupid"
-    warehouse_stockitemholdings ||--o{ warehouse_stockitemstockgroups : "stockitemid -> stockitemid"
-    warehouse_stockitems ||--o{ warehouse_stockitemstockgroups : "stockitemid -> stockitemid"
     Application_Countries ||--o{ Application_StateProvinces : "countryid -> countryid"
     Application_StateProvinces ||--o{ Application_Cities : "stateprovinceid -> stateprovinceid"
     Purchasing_Suppliers ||--o{ Application_SystemParameters : "deliveryaddressline2 -> deliveryaddressline2"
     Purchasing_Suppliers ||--o{ Application_SystemParameters : "postaladdressline1 -> postaladdressline1"
     Purchasing_Suppliers ||--o{ Application_SystemParameters : "postaladdressline2 -> postaladdressline2"
     Sales_Customers ||--o{ sales_orders : "customerid -> customerid"
-    application_transactiontypes ||--o{ warehouse_stockitemtransactions : "transactiontypeid -> transactiontypeid"
     sales_orders ||--o{ Sales_OrderLines : "orderid -> orderid"
-    warehouse_colors ||--o{ warehouse_stockitems : "colorid -> colorid"
-    warehouse_stockitemholdings ||--o{ purchasing_purchaseorderlines : "stockitemid -> stockitemid"
-    warehouse_stockitemholdings ||--o{ warehouse_stockitemtransactions : "stockitemid -> stockitemid"
-    warehouse_stockitemholdings ||--o{ Sales_OrderLines : "stockitemid -> stockitemid"
-    warehouse_stockitems ||--o{ purchasing_purchaseorderlines : "stockitemid -> stockitemid"
-    warehouse_stockitems ||--o{ warehouse_stockitemtransactions : "stockitemid -> stockitemid"
-    warehouse_stockitems ||--o{ Sales_OrderLines : "stockitemid -> stockitemid"
     Application_Countries ||--o{ Application_Cities : "latestrecordedpopulation -> latestrecordedpopulation"
     Application_StateProvinces ||--o{ Application_Cities : "latestrecordedpopulation -> latestrecordedpopulation"
     Purchasing_Suppliers ||--o{ Sales_Customers : "primarycontactpersonid -> primarycontactpersonid"

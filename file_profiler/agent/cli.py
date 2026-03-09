@@ -64,7 +64,7 @@ async def run_agent(
         else:
             return await _run_interactive(graph, initial_message, config)
     finally:
-        await client.__aexit__(None, None, None)
+        pass  # client sessions are auto-managed per tool call
 
 
 async def _run_autonomous(graph, initial_message: str, config: dict) -> str:
@@ -107,12 +107,12 @@ async def _run_interactive(graph, initial_message: str, config: dict) -> str:
     from file_profiler.agent.state import AgentState
     from langgraph.graph import END, START, StateGraph
     from langgraph.prebuilt import ToolNode, tools_condition
-    from file_profiler.agent.llm_factory import get_llm
+    from file_profiler.agent.llm_factory import get_llm_with_fallback
     from langchain_core.messages import SystemMessage
     from file_profiler.agent.graph import SYSTEM_PROMPT
 
     tools = client.get_tools()
-    llm = get_llm()
+    llm = get_llm_with_fallback()
     llm_with_tools = llm.bind_tools(tools)
 
     async def agent_node(state: AgentState):

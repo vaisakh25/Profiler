@@ -1,10 +1,33 @@
-# File Profiling Branch — Architecture & Design Document
+# File Profiling Architecture
 
 ## Overview
 
-The File Profiling branch handles profiling of raw files (CSV, JSON, Parquet, Excel) as the input source — as opposed to live database tables. It is the second major branch of the Data Profiling Tool and is critical for legacy modernization projects, where source data arrives as file exports rather than structured databases.
+The **Agentic Data Profiler** is a production-grade data profiling engine for tabular data (CSV, Parquet, JSON, Excel). It combines a deterministic 11-layer pipeline with LLM-powered enrichment to produce comprehensive data profiles, relationship maps, and ER diagrams.
 
-The output of this branch is **format-agnostic**: regardless of whether the source was a CSV or a Parquet file, the final profile object is identical to the database profiling output, allowing downstream Silver/Gold layer logic to remain source-unaware.
+The output is **format-agnostic**: regardless of whether the source was CSV or Parquet, the final profile object is identical, allowing downstream logic to remain source-unaware.
+
+```
+                          User / Chatbot
+                               │
+                    ┌──────────┴──────────┐
+                    │   LangGraph Agent    │  ← Interactive chatbot (Gemini 2.5 Flash)
+                    │   (multi-turn chat)  │
+                    └──────────┬──────────┘
+                               │ MCP protocol (SSE / stdio)
+                    ┌──────────┴──────────┐
+                    │   MCP Server         │  ← 7 tools, 2 resources, 3 prompts
+                    │   (FastMCP)          │
+                    └──────────┬──────────┘
+                               │
+          ┌────────────────────┼────────────────────┐
+          │                    │                    │
+   ┌──────┴──────┐    ┌───────┴───────┐    ┌───────┴───────┐
+   │ Deterministic│    │  Relationship │    │ LLM Enrichment│
+   │ Pipeline     │    │  Detector     │    │ (RAG Layer)   │
+   │ (11 layers)  │    │              │    │ ChromaDB +    │
+   │              │    │              │    │ Gemini        │
+   └──────────────┘    └──────────────┘    └───────────────┘
+```
 
 ---
 
@@ -15,478 +38,571 @@ The output of this branch is **format-agnostic**: regardless of whether the sour
 - **Be defensive at every layer.** Files are corrupted, partial, misformatted, and misrepresented far more often than database tables.
 - **Tolerate partial corruption.** Log bad rows and continue — do not abort the entire profile.
 - **Unified output.** Every file type produces the same JSON profile schema.
+- **No LLM in the pipeline.** Core profiling is pure deterministic logic (pattern matching, statistics, heuristics). LLM enrichment is an optional overlay.
 
 ---
 
-## Pipeline Overview
+## System Components
+
+### 1. MCP Server (`file_profiler/mcp_server.py`)
+
+FastMCP server exposing the profiler as standardised tools. Supports stdio (local) and SSE (remote) transports.
+
+**Tools (7):**
+
+| Tool | Description | Status |
+|------|-------------|--------|
+| `profile_file` | Profile a single file through the full 11-layer pipeline | Built |
+| `profile_directory` | Profile all supported files in a directory | Built |
+| `detect_relationships` | Detect FK relationships + generate ER diagram (deterministic) | Built |
+| `enrich_relationships` | Full pipeline + RAG + LLM enrichment (descriptions, PK/FK reassessment, join recommendations, enriched ER diagram) | Built |
+| `list_supported_files` | Scan a directory for supported data files | Built |
+| `upload_file` | Upload a base64-encoded file for profiling | Built |
+| `get_quality_summary` | Quality summary for a specific file | Built |
+
+**Resources (2):** `profiles://{table_name}`, `relationships://latest`
+
+**Prompts (3):** `summarize_profile`, `migration_readiness`, `quality_report`
+
+### 2. LangGraph Agent (`file_profiler/agent/`)
+
+Interactive chatbot and autonomous agent built on LangGraph.
+
+| Module | Purpose | Status |
+|--------|---------|--------|
+| `chatbot.py` | Multi-turn interactive chat loop with streaming | Built |
+| `graph.py` | ReAct-style StateGraph (agent ↔ tools loop) | Built |
+| `cli.py` | Autonomous / human-in-the-loop CLI runner | Built |
+| `state.py` | `AgentState` TypedDict with message history | Built |
+| `llm_factory.py` | Multi-provider LLM factory (Google, Groq, OpenAI, Anthropic) with automatic fallback | Built |
+| `enrichment.py` | RAG enrichment layer (ChromaDB + LLM analysis) | Built |
+| `progress.py` | Terminal progress tracking (spinner, bar, summaries) | Built |
+
+### 3. Deterministic Pipeline (11 Layers)
+
+Pure deterministic logic — no LLM. Pattern matching, statistics, and heuristics.
 
 ```
-File Intake Layer
-      │
-      ▼
-File Type Classification
-      │
-      ▼
-Size Strategy Selection
-      │
-      ├─── CSV ──────► CSV Profiling Engine
-      ├─── Parquet ──► Parquet Profiling Engine
-      ├─── JSON ─────► JSON Profiling Engine
-      └─── Excel ────► Excel Profiling Engine
-                              │
-                              ▼
-                   Column Profiling Engine
-                              │
-                              ▼
-                  Structural Quality Checks
-                              │
-                              ▼
-                   Column Intelligence Layer
-                              │
-                              ▼
-                      Unified Output (JSON)
+Layer 1   Intake Validator     →  file exists, readable, size, encoding
+Layer 2   Format Classifier    →  CSV / Parquet / JSON / Excel / Unknown
+Layer 3   Size Strategy        →  MEMORY_SAFE (<100MB) / LAZY_SCAN (100MB-2GB) / STREAM_ONLY (>2GB)
+Layer 4   Format Engine        →  csv_engine / parquet_engine / json_engine / excel_engine
+Layer 5   Standardization      →  column name normalisation, null sentinel replacement
+Layer 6   Column Profiler      →  null counts, distinct counts, top-N values, sample values
+Layer 7   Type Inference       →  INTEGER / FLOAT / BOOLEAN / DATE / TIMESTAMP / UUID / STRING / CATEGORICAL / FREE_TEXT
+Layer 8   Quality Checker      →  HIGH_NULL_RATIO, CONSTANT_COLUMN, TYPE_CONFLICT, STRUCTURAL_CORRUPTION
+Layer 9   Relationship Detect  →  cross-table FK candidates (name + type + cardinality + value overlap)
+Layer 10  Output Writers       →  JSON profiles, relationships.json, er_diagram.md
+Layer 11  MCP Server           →  tool handlers, caching, progress reporting
 ```
 
 ---
 
-## Layer 1 — File Intake
+## Pipeline Detail
 
-**Purpose:** Validate the file is readable and well-formed before any profiling begins.
+### Layer 1 — File Intake (`file_profiler/intake/validator.py`)
 
-**Checks performed:**
+Validates the file is readable and well-formed before any profiling begins.
 
-| Check               | Failure Behavior         |
-|---------------------|--------------------------|
-| File exists         | Raise `FileNotFoundError` |
-| File size > 0       | Raise `EmptyFileError`   |
-| Encoding detection  | Log, attempt UTF-8 fallback |
+| Check | Failure Behavior |
+|-------|-----------------|
+| File exists | Raise `FileNotFoundError` |
+| File size > 0 | Raise `EmptyFileError` |
+| Encoding detection | Log, attempt UTF-8 fallback |
 | Delimiter detection | Best-guess via content sniff |
-| Compression check   | Detect `.gz`, `.zip`, decompress before read |
+| Compression check | Detect `.gz`, `.zip`, decompress before read |
 
-**Critical edge cases:**
-- Corrupted or partially uploaded files
-- Binary files with a `.csv` extension
-- Excel files renamed to `.csv`
-- BOM (Byte Order Mark) characters at file start (`\xef\xbb\xbf`)
-- UTF-16 encoded files
+Critical edge cases: corrupted files, binary files with `.csv` extension, BOM characters, UTF-16 encoding.
 
-**Rule:** Validation must complete successfully before any downstream layer is invoked.
+### Layer 2 — Format Classification (`file_profiler/classification/classifier.py`)
+
+Determines actual file format using content sniffing (magic bytes), not file extension.
+
+| Format | Detection Signal |
+|--------|-----------------|
+| Parquet | Magic bytes `PAR1` at file start and end |
+| JSON | Starts with `{` or `[`, or valid NDJSON |
+| CSV | Consistent delimiter pattern across rows |
+| Excel | OLE2 or ZIP (XLSX) magic bytes |
+| UNKNOWN | None of the above match — skip profiling |
+
+### Layer 3 — Size Strategy (`file_profiler/strategy/size_strategy.py`)
+
+| Strategy | File Size | Behavior |
+|----------|-----------|----------|
+| `MEMORY_SAFE` | < 100 MB | Full read into memory |
+| `LAZY_SCAN` | 100 MB – 2 GB | Chunked reads, reservoir sampling |
+| `STREAM_ONLY` | > 2 GB | Stream with skip-interval sampling, DuckDB pushdown |
+
+### Layer 4 — Format Engines (`file_profiler/engines/`)
+
+| Engine | Key Approach |
+|--------|-------------|
+| `csv_engine.py` | Structure detection → header detection → row count estimation → sampling → column pivot |
+| `parquet_engine.py` | Schema from metadata (zero I/O) → row group sampling (Vitter's Algorithm R) |
+| `json_engine.py` | Shape detection → union schema discovery → flatten strategy (EXPLODE / STRINGIFY / HYBRID) |
+| `excel_engine.py` | Sheet iteration → row sampling |
+| `duckdb_sampler.py` | DuckDB-based reservoir sampling for >2GB files |
+
+### Layer 5 — Standardization (`file_profiler/standardization/normalizer.py`)
+
+- Column name normalisation (lowercase, underscores)
+- Null sentinel replacement ("NULL", "n/a", "nil", etc. → `None`)
+- Stores `original_name` for reverse mapping
+
+### Layer 6-7 — Column Profiling & Type Inference (`file_profiler/profiling/`)
+
+**Metrics per column:** `null_count`, `distinct_count`, `unique_ratio`, `cardinality`, `min`, `max`, `skewness`, `avg_length`, `length_p10/p50/p90/max`, `top_values` (top 10), `sample_values` (5 raw values).
+
+**Type inference order** (most specific to least):
+
+| Priority | Type | Detection |
+|----------|------|-----------|
+| 1 | `NULL_ONLY` | All values null |
+| 2 | `INTEGER` | Pattern `^-?\d+$` |
+| 3 | `FLOAT` | Numeric with decimal point |
+| 4 | `BOOLEAN` | Values in {true, false, 0, 1, yes, no} |
+| 5 | `DATE` | ISO 8601 date patterns |
+| 6 | `TIMESTAMP` | ISO 8601 datetime patterns |
+| 7 | `UUID` | 8-4-4-4-12 hex pattern |
+| 8 | `CATEGORICAL` | distinct/total < 10% AND distinct < 50 |
+| 9 | `FREE_TEXT` | avg length > 100 chars |
+| 10 | `STRING` | Default fallback |
+
+### Layer 8 — Quality Checks (`file_profiler/quality/structural_checker.py`)
+
+| Flag | Severity | Description |
+|------|----------|-------------|
+| `FULLY_NULL` | Critical | Every value in the column is null |
+| `HIGH_NULL_RATIO` | Warning | > 70% null values |
+| `CONSTANT_COLUMN` | Info | Only one distinct non-null value |
+| `TYPE_CONFLICT` | Warning | Same column has mixed types |
+| `MIXED_DATE_FORMATS` | Warning | Multiple date format patterns |
+| `MIXED_TIMEZONES` | Warning | Inconsistent timezones |
+| `DUPLICATE_COLUMN_NAME` | Critical | Two columns share the same name |
+| `COLUMN_SHIFT_ERROR` | Critical | Row field count != header field count |
+| `STRUCTURAL_CORRUPTION` | Critical | > 5% rows have structural issues |
+| `NULL_VARIANT_NORMALIZED` | Info | Null sentinels converted to None |
+
+### Layer 9 — Relationship Detection (`file_profiler/analysis/relationship_detector.py`)
+
+Cross-table FK candidate scoring using four additive signals:
+
+| Signal | Max Score | Evidence Codes |
+|--------|-----------|----------------|
+| Name match | 0.50 | `name:direct_prefix` (0.50), `name:singular_prefix` (0.45), `name:exact` (0.40), `name:embedded` (0.35) |
+| Type compatibility | 0.20 | `type:exact` (0.20), `type:numeric_compat` (0.10), `type:string_compat` (0.05) |
+| Cardinality | 0.25 | `pk:key_candidate` (0.20), `pk:high_unique` (0.15), `cardinality:fk_subset` (0.05) |
+| Value overlap | 0.15 | `overlap:high` (>=80%, 0.15), `overlap:medium` (50-80%, 0.10) |
+
+Confidence is the sum of matched signals, capped at 1.0. Minimum threshold: 0.30 (configurable).
+
+### Layer 10 — Output Writers (`file_profiler/output/`)
+
+| Writer | Output | Format |
+|--------|--------|--------|
+| `profile_writer.py` | `{table_name}_profile.json` | Unified JSON schema |
+| `relationship_writer.py` | `relationships.json` | FK candidates with evidence |
+| `er_diagram_writer.py` | `er_diagram.md` | Mermaid erDiagram |
 
 ---
 
-## Layer 2 — File Type Classification
+## LLM Enrichment Layer (`file_profiler/agent/enrichment.py`)
 
-**Purpose:** Determine the actual file format using content sniffing, not extension.
+RAG-based "second opinion" that uses an LLM to enrich the deterministic pipeline's output. This layer is **optional** — the deterministic pipeline produces complete results on its own.
 
-**Detection method — magic bytes / structure inspection:**
+### Architecture
 
-| Format   | Detection Signal                          |
-|----------|-------------------------------------------|
-| Parquet  | Magic bytes `PAR1` at file start and end  |
-| JSON     | Starts with `{` or `[`, or valid NDJSON   |
-| CSV      | Consistent delimiter pattern across rows  |
-| Excel    | OLE2 or ZIP (XLSX) magic bytes            |
-| UNKNOWN  | None of the above match                   |
+```
+Deterministic Pipeline Output
+        │
+        ▼
+┌──────────────────────────┐
+│   Document Builder        │
+│                           │
+│  Per-table documents:     │
+│  - Column schemas + types │
+│  - Quality flags          │
+│  - Low-cardinality cols   │
+│    with 15 sample values  │
+│  - 10 actual sample rows  │
+│    read from source file  │
+│                           │
+│  Relationship document:   │
+│  - All FK candidates +    │
+│    evidence + confidence  │
+│                           │
+│  Quality overview:        │
+│  - Aggregate metrics per  │
+│    table                  │
+└────────────┬─────────────┘
+             │
+             ▼
+┌──────────────────────────┐
+│   ChromaDB Vector Store   │
+│                           │
+│  Embeddings:              │
+│  - HuggingFace            │
+│    all-MiniLM-L6-v2       │
+│    (local, free, fast)    │
+│                           │
+│  Transient collection —   │
+│  created per enrichment,  │
+│  deleted after analysis   │
+└────────────┬─────────────┘
+             │  full context retrieval
+             │  (or similarity search
+             │   for >50 tables)
+             ▼
+┌──────────────────────────┐
+│   LLM Analysis            │
+│   (Gemini 2.5 Flash)      │
+│                           │
+│  Produces:                │
+│  1. Table descriptions    │
+│     (semantic meaning)    │
+│  2. Column descriptions   │
+│     (key columns)         │
+│  3. PK assessment         │
+│     (confirm/revise)      │
+│  4. FK reassessment +     │
+│     new FK suggestions    │
+│  5. JOIN type recs         │
+│     (INNER/LEFT/etc)      │
+│  6. Join path recs        │
+│     (analytical queries)  │
+│  7. Enriched ER diagram   │
+│     (Mermaid + labels)    │
+│  8. Quality remediations  │
+└──────────────────────────┘
+```
 
-**Why extension is unreliable:**
-- Ops teams frequently rename files during transfers
-- ETL exports sometimes write wrong extensions
-- Compressed files may strip extensions
+### What Gets Embedded
 
-If format is `UNKNOWN`, flag the file and skip profiling — do not attempt to force-read.
+| Data | Source | Purpose |
+|------|--------|---------|
+| Column schemas | `ColumnProfile` fields | Types, cardinality, key candidates, flags |
+| Low-cardinality values | `top_values` (up to 15 per column) | Understand categorical columns (e.g. gender codes, status values) |
+| Sample rows | Source file via PyArrow/CSV (10 rows) | Real data context — lets the LLM see actual values across columns together |
+| Relationships | `ForeignKeyCandidate` objects | FK/PK pairs with confidence scores and evidence codes |
+| Quality summary | `QualitySummary` per table | Aggregate quality metrics for recommendations |
+
+### Why Sample Rows Matter
+
+The deterministic pipeline stores `sample_values` per column (5 values each), but these are **column-isolated** — you can't see which values co-occur in the same row. The enrichment layer reads 10 actual rows from the source file, giving the LLM **row-level context**. This enables:
+
+- Better understanding of what each table represents (e.g. seeing `person_id=1, gender_concept_id=8507, year_of_birth=1963` together)
+- More accurate relationship detection (seeing how FK values correspond across tables)
+- Richer semantic descriptions
+
+### Why a Vector Store
+
+- For small datasets (< 50 tables), all documents are retrieved — the vector store acts as an embedding cache for the structured context.
+- For larger datasets (50+ tables), similarity search retrieves the most relevant table contexts, keeping the LLM prompt within token limits.
+- The collection is **transient** — created per enrichment run, deleted afterward. No persistent state to manage.
 
 ---
 
-## Layer 3 — Size Strategy Selection
+## Data Flow
 
-**Purpose:** Determine the read strategy before touching the file data, to avoid OOM errors.
+### Standard Flow (Deterministic Only)
 
-**Thresholds:**
+```
+User: "Profile my data in ./data/files"
+  │
+  ├─ list_supported_files(./data/files)
+  │    → [{file_name, format, size}, ...]
+  │
+  ├─ profile_directory(./data/files)
+  │    → Layers 1-8 per file → [FileProfile, ...]
+  │
+  ├─ detect_relationships(./data/files)
+  │    → Layer 9 → RelationshipReport + ER diagram
+  │
+  └─ Agent summarises findings
+```
 
-| Strategy      | File Size     | Behavior                                         |
-|---------------|---------------|--------------------------------------------------|
-| `MEMORY_SAFE` | < 100 MB      | Load fully into memory, standard read            |
-| `LAZY_SCAN`   | 100 MB – 2 GB | Chunked reads, Polars lazy frames, DuckDB scan   |
-| `STREAM_ONLY` | > 2 GB        | Stream line-by-line, never materialize full set  |
+### Enriched Flow (Deterministic + LLM RAG)
 
-The size strategy is passed as a parameter to all downstream format-specific profiling engines.
+```
+User: "Profile my data in ./data/files"
+  │
+  ├─ list_supported_files(./data/files)
+  │    → [{file_name, format, size}, ...]
+  │
+  ├─ enrich_relationships(./data/files)
+  │    │
+  │    ├─ Layers 1-8: profile all files
+  │    ├─ Layer 9: detect relationships (deterministic)
+  │    ├─ Extract 10 sample rows per table from source files
+  │    ├─ Build documents (schemas + samples + relationships + quality)
+  │    ├─ Embed into ChromaDB (text-embedding-004)
+  │    ├─ Retrieve context (full or similarity-based)
+  │    ├─ LLM analysis (Gemini 2.5 Flash)
+  │    │    → Descriptions, PK/FK reassessment, join paths, enriched ER diagram
+  │    └─ Cleanup transient vector store
+  │
+  └─ Agent presents enriched analysis + ER diagram
+```
 
 ---
 
-## Layer 4 — CSV Profiling Engine
+## Key Data Models
 
-CSV is the most complex format to profile reliably because it has no enforced schema and a wide range of structural variants.
+### FileProfile (`file_profiler/models/file_profile.py`)
 
-### Step A — Structure Detection
+```
+FileProfile
+├── source_type: "file"
+├── file_format: CSV | Parquet | JSON | Excel
+├── file_path: str
+├── table_name: str  (derived from filename stem)
+├── row_count: int
+├── is_row_count_exact: bool
+├── encoding: str
+├── size_bytes: int
+├── size_strategy: MEMORY_SAFE | LAZY_SCAN | STREAM_ONLY
+├── corrupt_row_count: int
+├── columns: [ColumnProfile]
+│   ├── name, declared_type, inferred_type, confidence_score
+│   ├── null_count, distinct_count, unique_ratio, cardinality
+│   ├── is_key_candidate, is_low_cardinality, is_nullable, is_constant, is_sparse
+│   ├── min, max, skewness (numeric)
+│   ├── avg_length, length_p10/p50/p90/max (string)
+│   ├── top_values: [{value, count}]  (top 10)
+│   ├── sample_values: [str]  (5 raw values)
+│   ├── quality_flags: [QualityFlag]
+│   └── semantic_type: str | None  (reserved for intelligence layer)
+├── structural_issues: [str]
+├── standardization_applied: bool
+└── quality_summary: QualitySummary
+    ├── columns_profiled, columns_with_issues
+    ├── null_heavy_columns, type_conflict_columns
+    └── corrupt_rows_detected
+```
 
-Before reading any data rows, detect:
+### RelationshipReport (`file_profiler/models/relationships.py`)
 
-| Property                | Method                                     |
-|-------------------------|--------------------------------------------|
-| Delimiter               | Frequency analysis of `,` `/` `\t` `\|`   |
-| Quote character         | Scan for `"` or `'` wrapping               |
-| Escape character        | Look for `\\` or doubled quotes            |
-| Header presence         | Heuristic on first row (see Step B)        |
-| Line ending type        | `\n` vs `\r\n`                             |
-| Inconsistent row widths | Count fields per row across first 100 rows |
+```
+RelationshipReport
+├── tables_analyzed: int
+├── columns_analyzed: int
+└── candidates: [ForeignKeyCandidate]  (sorted by confidence desc)
+    ├── fk: ColumnRef(table_name, column_name)
+    ├── pk: ColumnRef(table_name, column_name)
+    ├── confidence: float  (0.0–1.0, additive scoring)
+    ├── evidence: [str]    ("name:exact", "type:exact", "pk:key_candidate", ...)
+    ├── fk_null_ratio: float
+    ├── fk_distinct_count: int
+    ├── pk_distinct_count: int
+    └── top_value_overlap_pct: float | None
+```
 
-**Structural corruption flag:** If inconsistent row lengths exceed a threshold (e.g., >5% of sampled rows), flag the file as structurally corrupt before profiling continues.
+---
 
-**Edge cases to handle:**
-- Embedded commas inside quoted fields
-- Multiline quoted fields
-- Unescaped quotes mid-value
-- Irregular row widths at end of file (truncated export)
-- Corrupt rows embedded in the middle of an otherwise clean file
+## Configuration
 
-### Step B — Header Detection
+### Environment Variables
 
-Read the first 5 rows and apply heuristics:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROFILER_DATA_DIR` | `/data` | Root data directory |
+| `PROFILER_UPLOAD_DIR` | `{DATA_DIR}/uploads` | Upload staging area |
+| `PROFILER_OUTPUT_DIR` | `{DATA_DIR}/output` | Profile output directory |
+| `MCP_TRANSPORT` | `stdio` | Transport: `stdio`, `sse`, `streamable-http` |
+| `MCP_HOST` | `0.0.0.0` | Server bind address |
+| `MCP_PORT` | `8080` | Server port |
+| `MAX_PARALLEL_WORKERS` | `4` | Parallel profiling workers |
+| `LLM_PROVIDER` | `anthropic` | LLM provider: `anthropic`, `openai`, `google`, `groq` |
+| `LLM_MODEL` | (per provider) | Model override |
+| `GOOGLE_API_KEY` | — | Required for Google/Gemini provider |
+| `GROQ_API_KEY` | — | Required for Groq provider (automatic fallback from Google) |
+| `GROQ_MODEL` | — | Groq model override (default: `llama-3.3-70b-versatile`) |
 
-| Signal                                          | Interpretation     |
-|-------------------------------------------------|--------------------|
-| Row 1 is all non-numeric and all unique values  | Header present     |
-| Row 1 contains repeated values or numbers       | No header, generate `column_1, column_2 ...` |
-| Row 1 has any null/empty cells                  | Suspicious — flag  |
+### Tuning Constants (`file_profiler/config/settings.py`)
 
-Generated column names must be stable across re-reads.
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `MEMORY_SAFE_MAX_BYTES` | 100 MB | In-memory processing threshold |
+| `LAZY_SCAN_MAX_BYTES` | 2 GB | Lazy scanning threshold |
+| `SAMPLE_ROW_COUNT` | 10,000 | Rows sampled for profiling |
+| `TOP_N_VALUES` | 10 | Top frequent values per column |
+| `SAMPLE_VALUES_COUNT` | 5 | Raw sample values per column |
+| `NULL_HEAVY_THRESHOLD` | 0.70 | Null ratio flagging threshold |
+| `CATEGORICAL_MAX_DISTINCT` | 50 | Max distinct for CATEGORICAL |
+| `CARDINALITY_HIGH_THRESHOLD` | 0.90 | unique_ratio > this → HIGH |
+| `CARDINALITY_LOW_THRESHOLD` | 0.10 | unique_ratio <= this → LOW |
 
-### Step C — Row Count Estimation
+---
 
-**Do not count line-by-line for large files.** Use one of:
-- Chunk-and-extrapolate: read N chunks, average rows per byte, multiply by file size
-- OS-level size estimate: `file_size / avg_bytes_per_row`
-- Stream count with chunking: accumulate count without holding rows in memory
+## Running the System
 
-Store as `estimated_row_count` with a `is_exact` flag.
+### MCP Server
 
-### Step D — Sampling Strategy
+```bash
+conda activate gen_ai
 
-| File Size    | Method                                    |
-|--------------|-------------------------------------------|
-| < 100 MB     | Full read into memory                     |
-| 100 MB – 2 GB| Chunked read, reservoir sample N rows     |
-| > 2 GB       | Stream with skip-interval (every Kth row) |
+# stdio (local, for Claude Desktop / Claude Code)
+python -m file_profiler --transport stdio
 
-**Never use:**
+# SSE (for chatbot / remote agents)
+set PROFILER_DATA_DIR=C:\path\to\data
+python -m file_profiler --transport sse --port 8080
+```
+
+### Interactive Chatbot
+
+```bash
+# Start MCP server first (Terminal 1), then:
+python -m file_profiler.agent --chat --provider google
+```
+
+### Autonomous Agent
+
+```bash
+python -m file_profiler.agent --data-path ./data/files --provider google
+```
+
+### Direct Python API
+
 ```python
-df = pandas.read_csv(large_file)   # OOM risk
-```
+from file_profiler.main import profile_file, profile_directory, analyze_relationships
 
-**Use instead:**
-- `pandas.read_csv(chunksize=...)`
-- `polars.scan_csv(...)` with lazy evaluation
-- `duckdb.query("SELECT * FROM read_csv_auto(...) LIMIT N")`
+# Profile a single file
+profile = profile_file("data/files/person.parquet", output_dir="data/output")
 
-### Step E — Type Inference Engine
+# Profile a directory
+profiles = profile_directory("data/files", output_dir="data/output")
 
-CSV has no declared types — everything starts as string. Apply ordered detection per column on the sampled rows:
-
-**Inference order (most specific to least):**
-
-1. All null → `NULL_ONLY`
-2. All values match integer pattern → `INTEGER`
-3. All values match float/decimal pattern → `FLOAT`
-4. All values are `true/false/yes/no/1/0` → `BOOLEAN`
-5. All values match ISO date pattern → `DATE`
-6. All values match ISO timestamp pattern → `TIMESTAMP`
-7. All values match UUID pattern → `UUID`
-8. Low cardinality (< N distinct values) → `CATEGORICAL`
-9. Long average length → `FREE_TEXT`
-10. Default → `STRING`
-
-**Output per column:**
-```json
-{
-  "inferred_type": "DATE",
-  "confidence_score": 0.97
-}
-```
-
-**Never overwrite the raw string value** — store inferred type separately.
-
-**Edge cases requiring special handling:**
-
-| Issue                             | Strategy                                      |
-|-----------------------------------|-----------------------------------------------|
-| Mixed numeric + null              | Treat as nullable integer                     |
-| Numbers with commas (`1,000`)     | Strip commas before numeric check             |
-| Mixed date formats in one column  | Flag as `MIXED_DATE`, store format variants   |
-| Timestamps with mixed timezones   | Normalize to UTC, flag inconsistency          |
-| Leading zeros (`00123`)           | Keep as STRING — likely zip code or ID        |
-
----
-
-## Layer 5 — Parquet Profiling Engine
-
-Parquet is self-describing, making it significantly easier than CSV — but nested types require careful handling.
-
-### Step A — Read Schema Without Data Scan
-
-```python
-metadata = read_parquet_metadata(path)
-row_count   = metadata.row_count
-schema      = metadata.schema   # declared types, no I/O needed
-```
-
-Zero data rows are read at this stage.
-
-### Step B — Detect and Flatten Nested Fields
-
-Parquet supports nested types that must be surfaced as flat columns:
-
-| Parquet Type | Example                        | Flattened Name              |
-|--------------|--------------------------------|-----------------------------|
-| Struct       | `user.address.city`            | `user_address_city`         |
-| List         | `order.items[]`                | `order_items_0`, exploded   |
-| Map          | `attributes.{key: value}`      | `attributes_<key>`          |
-
-A **field mapping dictionary** must be persisted alongside the profile so the original path can be reconstructed later.
-
-### Step C — Column-Level Profiling via Pushdown
-
-Use DuckDB to push aggregations down into the Parquet file — do not load into memory:
-
-```sql
-SELECT
-    COUNT(*)              AS total,
-    COUNT(DISTINCT col)   AS unique_count,
-    MIN(col)              AS min_val,
-    MAX(col)              AS max_val
-FROM parquet_scan('file.parquet')
-```
-
-### Step D — Large Multi-GB Parquet Strategy
-
-- Profile one column at a time
-- Never `SELECT *` on multi-GB files
-- Use column pruning: `SELECT col1 FROM parquet_scan(...)`
-- Avoid materializing the full dataset at any point
-
----
-
-## Layer 6 — JSON Profiling Engine
-
-JSON is the hardest file format to profile due to its schema flexibility and nesting depth.
-
-### Step A — Detect JSON Shape
-
-| Shape                 | Detection                                        |
-|-----------------------|--------------------------------------------------|
-| Single object         | File starts with `{`, top-level is one record    |
-| Array of objects      | File starts with `[`, top-level is an array      |
-| Newline-delimited JSON (NDJSON) | Each line is a valid `{}` object       |
-| Deep nested structure | Any of the above with objects inside objects     |
-
-Shape determines the read strategy for all downstream steps.
-
-### Step B — Schema Discovery via Union
-
-Stream-parse the first N records (default: 1,000). For each record:
-- Collect all keys (recursively for nested objects)
-- Track the observed type(s) per key across all records
-- Track how many records contain each key (`occurrence_ratio`)
-
-**Output:**
-```python
-{
-  "column_name": "order.customer.id",
-  "observed_types": {"string", "null"},
-  "occurrence_ratio": 0.98   # present in 98% of records
-}
-```
-
-**Critical edge cases:**
-- Same key holds different types across records → flag as `TYPE_CONFLICT`
-- Keys missing from some records → reflected in `occurrence_ratio < 1.0`
-- Arrays of objects inside a field → must decide flatten vs. keep-as-string
-
-### Step C — Flatten Strategy
-
-Three options (configurable):
-
-| Strategy      | Behavior                                              | Use When                        |
-|---------------|-------------------------------------------------------|---------------------------------|
-| `EXPLODE`     | Arrays expand into multiple rows                      | Small arrays, need row-level access |
-| `STRINGIFY`   | Nested objects/arrays kept as JSON string column      | Deep nesting, preserve structure |
-| `HYBRID`      | Flatten known shallow fields, stringify deep arrays   | General purpose (recommended)   |
-
-**Rule:** Never blindly explode large arrays — a single record with a 10,000-item array would produce 10,000 rows, destroying row count integrity.
-
----
-
-## Layer 7 — Column Profiling Engine (File Path)
-
-After type inference and schema discovery, compute the standard column metrics. This layer is **shared across all file formats**.
-
-**Metrics computed:**
-
-| Metric                  | Large File Strategy                        |
-|-------------------------|--------------------------------------------|
-| `null_count`            | Exact count from sample                    |
-| `distinct_count`        | Approximate via hash sampling if > 1M rows |
-| `min` / `max`           | Exact for numeric/date; lexicographic for string |
-| `string_length_distribution` | P10, P50, P90, max                    |
-| `top_N_values`          | Top 10 most frequent values + counts       |
-| `skewness`              | Numeric columns only                       |
-| `avg_length`            | Mean string length                         |
-
-**Approximate distinct count:** For very large columns, use hash-modulo sampling to estimate cardinality without materializing all unique values.
-
----
-
-## Layer 8 — Structural Quality Checks
-
-File-specific structural issues that do not exist in well-managed databases:
-
-| Check                    | Description                                                    |
-|--------------------------|----------------------------------------------------------------|
-| Duplicate column names   | Two columns with the same header name                         |
-| Fully null columns       | Every value in the column is null                             |
-| Constant columns         | Only one distinct non-null value                              |
-| High-null ratio          | > 70% of rows are null for a column                          |
-| Column shift errors      | Row has fewer/more fields than header (misalignment)          |
-| Encoding inconsistencies | Mixed UTF-8 and Latin-1 within same file                     |
-
-Each check produces a `quality_flag` entry in the column profile.
-
----
-
-## Layer 9 — Legacy Flat File Handling
-
-Fixed-width and legacy export files are a special case that require positional parsing rather than delimiter detection.
-
-**Fixed-width files:**
-- Require a **position mapping config** (column name → start/end byte position)
-- No delimiter detection applies
-- Column boundaries are absolute character positions
-- Values are right/left padded — strip before type inference
-
-**Other legacy patterns:**
-
-| Pattern                  | Handling                                              |
-|--------------------------|-------------------------------------------------------|
-| Encoded date formats     | Map legacy format (e.g., `YYYYMMDD`) to ISO           |
-| Truncated values         | Flag columns where max length == field width exactly  |
-| Multi-line logical records | Buffer lines until record terminator is found       |
-
----
-
-## Layer 10 — Performance Strategy
-
-| Rule                                              | Reason                                      |
-|---------------------------------------------------|---------------------------------------------|
-| Process one file at a time                        | Avoids memory contention between large files |
-| Never hold full dataset in memory for large files | OOM protection                              |
-| Release memory after each file's profile is saved | Allow GC to reclaim before next file        |
-| Persist profile immediately after each file       | Prevents loss on crash mid-batch            |
-| Use DuckDB for all SQL-style aggregations on files | Pushdown avoids full materialization        |
-
-**Recommended readers by format:**
-
-| Format  | Recommended Tool                           |
-|---------|--------------------------------------------|
-| CSV     | `duckdb.read_csv_auto`, `polars.scan_csv`  |
-| Parquet | `duckdb.parquet_scan`, `pyarrow.parquet`   |
-| JSON    | `orjson` for streaming parse               |
-| Excel   | `openpyxl` (never `xlrd` for XLSX)         |
-
----
-
-## Layer 11 — Unified Output Schema
-
-Regardless of source file format, the output profile must be identical to the database profiling output. This makes the downstream Silver layer completely source-agnostic.
-
-```json
-{
-  "source_type": "file",
-  "file_format": "csv",
-  "file_path": "/data/exports/orders_2024.csv",
-  "table_name": "orders_2024",
-  "row_count": 150000,
-  "is_row_count_exact": true,
-  "encoding": "utf-8",
-  "size_strategy": "LAZY_SCAN",
-
-  "columns": [
-    {
-      "name": "order_id",
-      "declared_type": null,
-      "inferred_type": "INTEGER",
-      "confidence_score": 0.99,
-      "null_count": 0,
-      "distinct_count": 150000,
-      "unique_ratio": 1.0,
-      "cardinality": "HIGH",
-      "min": "1",
-      "max": "150000",
-      "avg_length": 5.2,
-      "is_nullable": false,
-      "is_constant": false,
-      "is_sparse": false,
-      "is_key_candidate": true,
-      "is_low_cardinality": false,
-      "semantic_type": "identifier",
-      "quality_flags": [],
-      "sample_values": ["1", "2", "3"]
-    }
-  ],
-
-  "structural_issues": [],
-  "quality_summary": {
-    "columns_profiled": 12,
-    "columns_with_issues": 1,
-    "null_heavy_columns": 0,
-    "type_conflict_columns": 0,
-    "corrupt_rows_detected": 0
-  }
-}
+# Detect relationships
+report = analyze_relationships(profiles, output_path="data/output/relationships.json")
 ```
 
 ---
 
-## Layer 12 — Advanced Edge Cases
+## Project Structure
 
-| Scenario                             | Handling Strategy                                         |
-|--------------------------------------|-----------------------------------------------------------|
-| 10M rows, 3 columns                  | Stream count, full column-level scan via DuckDB           |
-| 10 columns, 2GB single text column   | Profile other columns normally; skip stats on text column |
-| CSV with 20% corrupted rows          | Log bad rows, profile on clean rows, flag corruption rate |
-| JSON with 50% records missing a key  | Track `occurrence_ratio`, mark column as optional         |
-| UTF-16 encoding                      | Detect via BOM, transcode to UTF-8 before read            |
-| Multi-file partition (folder of CSVs)| Treat as single logical table, union schema across files  |
-| Incremental drop files               | Compare schema against previous profile; flag drift       |
+```
+file_profiler/
+├── __init__.py
+├── __main__.py              # Entry point → mcp_server.main()
+├── main.py                  # Pipeline orchestrator
+├── mcp_server.py            # MCP server (7 tools, 2 resources, 3 prompts)
+│
+├── agent/                   # LangGraph agent + chatbot
+│   ├── chatbot.py           # Interactive multi-turn chatbot
+│   ├── graph.py             # ReAct StateGraph
+│   ├── cli.py               # Autonomous / interactive CLI
+│   ├── state.py             # AgentState TypedDict
+│   ├── llm_factory.py       # Multi-provider LLM factory
+│   └── enrichment.py        # RAG enrichment (ChromaDB + LLM)
+│
+├── config/
+│   ├── env.py               # Environment-based config
+│   └── settings.py          # Tuning constants
+│
+├── intake/
+│   └── validator.py          # Layer 1: file validation
+│
+├── classification/
+│   └── classifier.py         # Layer 2: format detection
+│
+├── strategy/
+│   └── size_strategy.py      # Layer 3: size strategy selection
+│
+├── engines/                  # Layer 4: format-specific engines
+│   ├── csv_engine.py
+│   ├── parquet_engine.py
+│   ├── json_engine.py
+│   ├── excel_engine.py
+│   └── duckdb_sampler.py
+│
+├── standardization/          # Layer 5: normalisation
+│   └── normalizer.py
+│
+├── profiling/                # Layers 6-7: profiling + type inference
+│   ├── column_profiler.py
+│   └── type_inference.py
+│
+├── quality/                  # Layer 8: quality checks
+│   └── structural_checker.py
+│
+├── analysis/                 # Layer 9: relationship detection
+│   └── relationship_detector.py
+│
+├── output/                   # Layer 10: serialisation
+│   ├── profile_writer.py
+│   ├── relationship_writer.py
+│   └── er_diagram_writer.py
+│
+├── models/                   # Data models
+│   ├── file_profile.py
+│   ├── relationships.py
+│   └── enums.py
+│
+└── utils/
+    ├── file_resolver.py
+    └── logging_setup.py
+```
 
 ---
 
-## Integration with Database Branch
+## Dependencies
 
-The file profiling branch produces the same output schema as the database branch. Both feed into the shared **Column Intelligence Layer**:
+```toml
+# Core pipeline
+pyarrow >= 21.0.0           # Parquet engine
+chardet >= 5.2.0             # Encoding detection
+mcp[cli] >= 1.0.0            # MCP server framework
 
+# Agent + chatbot
+langgraph >= 1.0.0
+langchain-core >= 1.2.0
+langchain-mcp-adapters >= 0.2.0
+
+# LLM providers (pick one or more)
+langchain-google-genai >= 4.2.0   # Gemini (default for chatbot)
+langchain-groq >= 1.0.0           # Groq (fallback from Google)
+langchain-anthropic >= 1.0.0      # Claude
+langchain-openai >= 0.3.0         # OpenAI
+
+# RAG enrichment
+chromadb >= 1.5.0
+langchain-chroma >= 1.1.0
+langchain-huggingface >= 0.1.0    # HuggingFace embeddings (all-MiniLM-L6-v2)
+sentence-transformers >= 3.0.0    # Local embedding model
+
+# Dev
+pytest >= 8.4.0
+pytest-asyncio >= 0.24.0
+duckdb >= 1.4.0
 ```
-Database Branch ──┐
-                  ├──► Column Intelligence Layer ──► Unified Metadata Report
-File Branch ──────┘
-```
-
-The Column Intelligence Layer (PII tagging, key detection, description generation, semantic typing, knowledge graph indexing) is **completely reusable** across both branches — no duplication.
 
 ---
 
-## What Is NOT Yet Implemented
+## Implementation Status
 
-The following components from this design spec do not yet exist in the codebase and will need to be built:
-
-| Component                        | Status      |
-|----------------------------------|-------------|
-| File Intake Validator            | Not built   |
-| File Type Classifier             | Not built   |
-| Size Strategy Selector           | Not built   |
-| CSV Profiling Engine             | Not built   |
-| Parquet Profiling Engine         | Not built   |
-| JSON Profiling Engine            | Not built   |
-| Legacy Flat File Handler         | Not built   |
-| Structural Quality Checker       | Not built   |
-| Unified File Profile Writer      | Not built   |
-| Multi-file partition support     | Not built   |
-| Schema drift detection           | Not built   |
+| Component | Status |
+|-----------|--------|
+| File Intake Validator (Layer 1) | Built |
+| File Type Classifier (Layer 2) | Built |
+| Size Strategy Selector (Layer 3) | Built |
+| CSV Profiling Engine (Layer 4) | Built |
+| Parquet Profiling Engine (Layer 4) | Built |
+| JSON Profiling Engine (Layer 4) | Built |
+| Excel Profiling Engine (Layer 4) | Built |
+| DuckDB Sampler (Layer 4) | Built |
+| Standardization (Layer 5) | Built |
+| Column Profiler (Layer 6) | Built |
+| Type Inference (Layer 7) | Built |
+| Structural Quality Checker (Layer 8) | Built |
+| Relationship Detector (Layer 9) | Built |
+| Profile Writer (Layer 10) | Built |
+| ER Diagram Writer (Layer 10) | Built |
+| MCP Server (Layer 11) | Built |
+| LangGraph Agent + Chatbot | Built |
+| LLM Enrichment / RAG Layer | Built |
+| Multi-file partition support | Not built |
+| Schema drift detection | Not built |
+| Legacy flat file handler | Not built |
+| Docker packaging | Not built |

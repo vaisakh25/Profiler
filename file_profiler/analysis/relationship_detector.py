@@ -32,7 +32,7 @@ from file_profiler.models.relationships import (
 log = logging.getLogger(__name__)
 
 # Minimum confidence to include a candidate in the report.
-MIN_CONFIDENCE: float = 0.30
+MIN_CONFIDENCE: float = 0.50
 
 # Minimum length of the stripped pk_table name before attempting name patterns.
 # Guards against degenerate short table names ("a", "ab") causing false positives.

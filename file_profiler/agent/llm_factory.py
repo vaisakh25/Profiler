@@ -6,20 +6,34 @@ Supported providers:
 * ``anthropic`` (default) — requires ``langchain-anthropic`` + ``ANTHROPIC_API_KEY``
 * ``openai``              — requires ``langchain-openai``    + ``OPENAI_API_KEY``
 * ``google``              — requires ``langchain-google-genai`` + ``GOOGLE_API_KEY``
+* ``groq``                — requires ``langchain-groq``      + ``GROQ_API_KEY``
+
+When ``provider="google"``, if the Google call fails (e.g. quota exhausted)
+and ``GROQ_API_KEY`` is set, the factory can be re-invoked with
+``provider="groq"`` to fall back automatically.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
+log = logging.getLogger(__name__)
+
 # Default models per provider
 _DEFAULT_MODELS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-20250514",
     "openai": "gpt-4o",
-    "google": "gemini-2.0-flash",
+    "google": "gemini-2.5-flash",
+    "groq": "llama-3.3-70b-versatile",
+}
+
+# Fallback chain: if a provider fails, try the next one
+_FALLBACK_CHAIN: dict[str, str] = {
+    "google": "groq",
 }
 
 
@@ -31,7 +45,7 @@ def get_llm(
     """Create a chat model instance.
 
     Args:
-        provider: One of ``"anthropic"``, ``"openai"``, ``"google"``.
+        provider: One of ``"anthropic"``, ``"openai"``, ``"google"``, ``"groq"``.
                   Falls back to the ``LLM_PROVIDER`` env var, then ``"anthropic"``.
         model:    Model name override.  Falls back to ``LLM_MODEL`` env var,
                   then a sensible default per provider.
@@ -53,11 +67,56 @@ def get_llm(
         return _make_openai(model, temperature)
     if provider == "google":
         return _make_google(model, temperature)
+    if provider == "groq":
+        return _make_groq(model, temperature)
 
     raise ValueError(
         f"Unknown LLM provider '{provider}'. "
-        f"Supported: anthropic, openai, google."
+        f"Supported: anthropic, openai, google, groq."
     )
+
+
+def get_llm_with_fallback(
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    temperature: float = 0.0,
+) -> BaseChatModel:
+    """Create a chat model with automatic fallback.
+
+    Tries the primary provider first. If it fails to instantiate (missing
+    API key, import error), falls back through the chain:
+    ``google → groq``.
+
+    Returns:
+        A LangChain ``BaseChatModel`` instance.
+    """
+    provider = (provider or os.getenv("LLM_PROVIDER", "anthropic")).lower()
+
+    try:
+        return get_llm(provider=provider, model=model, temperature=temperature)
+    except (ImportError, ValueError, Exception) as exc:
+        fallback = _FALLBACK_CHAIN.get(provider)
+        if fallback and os.getenv(_api_key_env(fallback)):
+            log.warning(
+                "Primary provider '%s' failed (%s), falling back to '%s'",
+                provider, exc, fallback,
+            )
+            return get_llm(
+                provider=fallback,
+                model=_DEFAULT_MODELS.get(fallback),
+                temperature=temperature,
+            )
+        raise
+
+
+def _api_key_env(provider: str) -> str:
+    """Return the environment variable name for a provider's API key."""
+    return {
+        "anthropic": "ANTHROPIC_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "google": "GOOGLE_API_KEY",
+        "groq": "GROQ_API_KEY",
+    }.get(provider, "")
 
 
 def _make_anthropic(model: str, temperature: float) -> BaseChatModel:
@@ -91,3 +150,14 @@ def _make_google(model: str, temperature: float) -> BaseChatModel:
             "Install it with: pip install langchain-google-genai"
         ) from exc
     return ChatGoogleGenerativeAI(model=model, temperature=temperature)
+
+
+def _make_groq(model: str, temperature: float) -> BaseChatModel:
+    try:
+        from langchain_groq import ChatGroq
+    except ImportError as exc:
+        raise ImportError(
+            "langchain-groq is required for the Groq provider. "
+            "Install it with: pip install langchain-groq"
+        ) from exc
+    return ChatGroq(model=model, temperature=temperature)

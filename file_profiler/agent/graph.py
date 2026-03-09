@@ -23,8 +23,26 @@ from langchain_core.messages import SystemMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from file_profiler.agent.llm_factory import get_llm
+from langchain_core.messages import ToolMessage
+
+from file_profiler.agent.llm_factory import get_llm_with_fallback
 from file_profiler.agent.state import AgentState
+
+# Max chars kept per tool result to stay within Groq's context window
+_MAX_TOOL_CHARS = 3000
+
+
+def _trim_messages(messages: list) -> list:
+    """Truncate oversized ToolMessage content to avoid context overflow."""
+    trimmed = []
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            if len(content) > _MAX_TOOL_CHARS:
+                content = content[:_MAX_TOOL_CHARS] + "\n...[truncated]"
+                msg = ToolMessage(content=content, tool_call_id=msg.tool_call_id)
+        trimmed.append(msg)
+    return trimmed
 
 log = logging.getLogger(__name__)
 
@@ -98,8 +116,7 @@ async def create_agent(
     )
 
     # Connect and load tools
-    await client.__aenter__()
-    tools = client.get_tools()
+    tools = await client.get_tools()
 
     if not tools:
         raise RuntimeError(
@@ -110,7 +127,7 @@ async def create_agent(
     log.info("Loaded %d MCP tools: %s", len(tools), [t.name for t in tools])
 
     # Create LLM and bind tools
-    llm = get_llm(provider=provider, model=model)
+    llm = get_llm_with_fallback(provider=provider, model=model)
     llm_with_tools = llm.bind_tools(tools)
 
     # Define agent node
@@ -119,6 +136,7 @@ async def create_agent(
         # Prepend system prompt if not already present
         if not messages or not isinstance(messages[0], SystemMessage):
             messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(messages)
+        messages = _trim_messages(messages)
         response = await llm_with_tools.ainvoke(messages)
         return {"messages": [response]}
 

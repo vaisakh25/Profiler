@@ -10,7 +10,7 @@ Transports:
 
 Usage:
   python -m file_profiler --transport stdio
-  python -m file_profiler --transport sse --host 0.0.0.0 --port 8080
+  python -m file_profiler --transport sse --host 0.0.0.0 --port 8081
 """
 
 from __future__ import annotations
@@ -236,7 +236,7 @@ async def profile_directory(
 @mcp.tool()
 async def detect_relationships(
     dir_path: str,
-    confidence_threshold: float = 0.30,
+    confidence_threshold: float = 0.50,
     ctx: Context = None,
 ) -> dict:
     """
@@ -248,7 +248,7 @@ async def detect_relationships(
 
     Args:
         dir_path: Path to directory with data files.
-        confidence_threshold: Minimum confidence to include (default 0.30).
+        confidence_threshold: Minimum confidence to include (default 0.50).
 
     Returns:
         RelationshipReport with FK candidates sorted by confidence.
@@ -291,6 +291,84 @@ async def detect_relationships(
     log.info("Relationships detected: %d candidates",
              len(result.get("candidates", [])))
     return result
+
+
+@mcp.tool()
+async def enrich_relationships(
+    dir_path: str,
+    provider: str = "groq",
+    model: str | None = None,
+    ctx: Context = None,
+) -> dict:
+    """
+    Enrich detected relationships using LLM analysis over a vector store.
+
+    Profiles all files, detects relationships, then builds a ChromaDB vector
+    store from profiles + sample rows + low-cardinality values.  An LLM
+    analyses the full context to produce:
+      - Semantic table/column descriptions
+      - PK/FK confidence reassessment
+      - Join path recommendations
+      - An enriched ER diagram with descriptions
+      - Data quality recommendations
+
+    This is a "second opinion" layer on top of the deterministic pipeline.
+    Run this AFTER detect_relationships for a richer analysis.
+
+    Args:
+        dir_path: Path to directory with data files.
+        provider: LLM provider — "groq" (default), "google", "openai", or "anthropic".
+        model:    Model name override (default: provider's default model).
+
+    Returns:
+        Dict with enrichment analysis text, enriched ER diagram,
+        and metadata (tables/relationships analysed, documents embedded).
+    """
+    from file_profiler.agent.enrichment import enrich
+
+    resolved = resolve_path(dir_path)
+
+    if ctx:
+        await ctx.report_progress(0, 4, "Profiling directory")
+
+    results = _pipeline_profile_directory(
+        resolved, output_dir=OUTPUT_DIR, parallel=True,
+    )
+
+    # Cache individual profiles
+    for r in results:
+        _profile_cache[r.table_name] = _to_dict(r)
+
+    if ctx:
+        await ctx.report_progress(1, 4, "Detecting relationships")
+
+    report = _pipeline_analyze(
+        results,
+        output_path=OUTPUT_DIR / "relationships.json",
+        er_diagram_path=OUTPUT_DIR / "er_diagram.md",
+    )
+
+    if ctx:
+        await ctx.report_progress(2, 4, "Building vector store & LLM enrichment")
+
+    enrichment_result = await enrich(
+        profiles=results,
+        report=report,
+        dir_path=dir_path,
+        provider=provider,
+        model=model,
+    )
+
+    if ctx:
+        await ctx.report_progress(4, 4, "Enrichment complete")
+
+    log.info(
+        "Enrichment complete: %d tables, %d relationships, %d docs embedded",
+        enrichment_result["tables_analyzed"],
+        enrichment_result["relationships_analyzed"],
+        enrichment_result["documents_embedded"],
+    )
+    return enrichment_result
 
 
 @mcp.tool()
